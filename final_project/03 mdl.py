@@ -41,6 +41,10 @@ import itertools
 
 # COMMAND ----------
 
+spark.sql("SELECT * FROM train_bike_weather_netChange_s").toPandas()
+
+# COMMAND ----------
+
 # Read the data from the silver table
 SOURCE_DATA = spark.sql("SELECT * FROM train_bike_weather_netChange_s").toPandas()
 ARTIFACT_PATH = "G10-model"
@@ -51,109 +55,100 @@ def extract_params(pr_model):
     return {attr: getattr(pr_model, attr) for attr in serialize.SIMPLE_ATTRIBUTES}
 
 # Rename columns to match Prophet's expected format
-SOURCE_DATA = SOURCE_DATA.rename(columns={'dates': 'ds', 'net_change': 'y'})
+SOURCE_DATA = SOURCE_DATA.rename(columns={'dates': 'ts', 'net_change': 'y'})
 
 # Visualize data using seaborn
 sns.set(rc={'figure.figsize':(12,8)})
-sns.lineplot(x=SOURCE_DATA['ds'], y=SOURCE_DATA['y'])
+sns.lineplot(x=SOURCE_DATA['ts'], y=SOURCE_DATA['y'])
 plt.legend(['Net Bike Change Data'])
 
 # COMMAND ----------
 
-# Initialize and fit the model
-model = Prophet()
-model.fit(SOURCE_DATA)
+# MAGIC %md
+# MAGIC ## Create a Baseline Model and record the performance
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Data preprocessing
+
+# COMMAND ----------
+
+SOURCE_DATA = spark.sql("SELECT * FROM train_bike_weather_netChange_s").toPandas()
+SOURCE_DATA.head()
+
+# COMMAND ----------
+
+SOURCE_DATA['feels_like'].fillna(0, inplace=True)
+SOURCE_DATA['rain_1h'].fillna(0, inplace=True)
+SOURCE_DATA['holiday'] = SOURCE_DATA['holiday'].apply(lambda x: 1 if x == "true" else 0)
+# Rename net_change column to 'y'
+SOURCE_DATA.rename(columns={'net_change': 'y'}, inplace=True)
+SOURCE_DATA = SOURCE_DATA.drop(['dayofweek', 'description'], axis=1)
+SOURCE_DATA = SOURCE_DATA.rename(columns={'ts': 'ds'})
+
+SOURCE_DATA.head()
+
+# COMMAND ----------
+
+from prophet import Prophet
+from prophet.diagnostics import cross_validation, performance_metrics
+
+# Initiate the model
+baseline_model = Prophet()
+
+# Add additional regressors
+baseline_model.add_regressor('year')
+baseline_model.add_regressor('month')
+baseline_model.add_regressor('dayofmonth')
+baseline_model.add_regressor('hour')
+baseline_model.add_regressor('feels_like')
+baseline_model.add_regressor('rain_1h')
+baseline_model.add_regressor('holiday')
+
+
+# Fit the model on the training dataset
+baseline_model.fit(SOURCE_DATA)
+
+# Cross validation
+baseline_model_cv = cross_validation(baseline_model, initial='30 days', period='7 days', horizon='4 hours',parallel="threads")
+
+# Model performance metrics
+baseline_model_p = performance_metrics(baseline_model_cv, rolling_window=1)
+baseline_model_p.head()
+
+# Get the performance value
+print(f"MAE of baseline model: {baseline_model_p['mae'].values[0]}")
+
+
+
+# COMMAND ----------
+
+
+
+import matplotlib.pyplot as plt
 
 # Make hourly predictions for the next 4 hours
-future = model.make_future_dataframe(periods=4, freq='H')
-forecast = model.predict(future)
+future = baseline_model.make_future_dataframe(periods=4, freq='H')
+
+# Add the additional regressors to the future dataframe
+future['year'] = future['ds'].dt.year
+future['month'] = future['ds'].dt.month
+future['dayofmonth'] = future['ds'].dt.day
+future['hour'] = future['ds'].dt.hour
+future['holiday'] = SOURCE_DATA['holiday'].astype(int)
+future['feels_like'] = SOURCE_DATA['feels_like']
+future['rain_1h'] = SOURCE_DATA['rain_1h']
+
+forecast = baseline_model.predict(future)
 
 # Visualize the predictions
-fig = model.plot(forecast)
+fig = baseline_model.plot(forecast)
 plt.title('Hourly Net Bike Change Forecast')
 plt.show()
 
-
 # COMMAND ----------
 
-#Defining a function that trains a Prophet model with given hyperparameters and logs the metrics and artifacts to MLflow
-import tempfile
-import os
-from prophet.diagnostics import performance_metrics
-from prophet.plot import plot_cross_validation_metric
-
-def train_prophet_model(df, changepoint_prior_scale, seasonality_prior_scale, experiment_id):
-    with mlflow.start_run(experiment_id=experiment_id):
-        # Initialize and fit the model
-        model = Prophet(changepoint_prior_scale=changepoint_prior_scale, seasonality_prior_scale=seasonality_prior_scale)
-        model.fit(df)
-
-        # Cross-validation
-        df_cv = cross_validation(model, initial='730 days', period='180 days', horizon='30 days')
-        df_p = performance_metrics(df_cv, rolling_window=1)
-
-        # Log metrics
-        mlflow.log_metric("mape", df_p['mape'].mean())
-        mlflow.log_metric("rmse", df_p['rmse'].mean())
-
-        # Log hyperparameters
-        mlflow.log_param("changepoint_prior_scale", changepoint_prior_scale)
-        mlflow.log_param("seasonality_prior_scale", seasonality_prior_scale)
-
-        # Log model artifacts
-        with tempfile.TemporaryDirectory() as temp_dir:
-            model_file = os.path.join(temp_dir, "model.pkl")
-            model.serialize(model_file)
-            mlflow.log_artifact(model_file, "model")
-            
-        # Return the run ID
-        return mlflow.active_run().info.run_id
-
-
-# COMMAND ----------
-
-# Run a hyperparameter search using MLflow experiments
-
-# Set your MLflow experiment ID
-experiment_name = "xxxx"
-experiment_id = mlflow.create_experiment(experiment_name)
-print(f"Experiment created with name '{experiment_name}' and ID '{experiment_id}'")
-
-EXPERIMENT_ID = experiment_id
-
-# Define the hyperparameter search space
-changepoint_prior_scales = [0.001, 0.01, 0.1]
-seasonality_prior_scales = [1, 5, 10]
-
-# Run the hyperparameter search
-for changepoint_prior_scale, seasonality_prior_scale in itertools.product(changepoint_prior_scales, seasonality_prior_scales):
-    run_id = train_prophet_model(SOURCE_DATA, changepoint_prior_scale, seasonality_prior_scale, EXPERIMENT_ID)
-    print(f"Finished run with changepoint_prior_scale={changepoint_prior_scale}, seasonality_prior_scale={seasonality_prior_scale}, run_id={run_id}")
-
-
-# COMMAND ----------
-
-# Get the best run based on the lowest MAPE
-best_run = mlflow.search_runs(experiment_ids=[EXPERIMENT_ID], order_by=["metrics.mape"]).iloc[0]
-
-# Register the best model to the Databricks Model Registry
-model_uri = f"runs:/{best_run.run_id}/model"
-model_name = "GROUP_MODEL_NAME"
-mlflow.register_model(model_uri, model_name)
-
-# Promote the registered model to staging and production
-client = mlflow.tracking.MlflowClient()
-client.transition_model_version_stage(
-    name=model_name,
-    version=1,
-    stage="Staging"
-)
-
-client.transition_model_version_stage(
-    name=model_name,
-    version=1,
-    stage="Production"
-)
 
 
 # COMMAND ----------
