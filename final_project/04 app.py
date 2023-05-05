@@ -82,7 +82,6 @@ display(map)
 # MAGIC %md
 # MAGIC ### Data Preprocessing for Test Data
 
-
 # COMMAND ----------
 
 # create and register function
